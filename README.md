@@ -26,6 +26,12 @@ Launch the GUI (shows images, progress bars, and control buttons):
 ros2 launch arm_camera_calibration gui.launch.py
 ```
 
+Launch the full workflow with GUI from a single launch file:
+
+```bash
+ros2 launch arm_camera_calibration all.launch.py
+```
+
 Optional refinement uses SciPy's LM solver. Ensure `python3-scipy` is installed if you enable
 `refine_with_lm`.
 

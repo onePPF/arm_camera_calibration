@@ -11,7 +11,11 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         (
             "share/" + package_name + "/launch",
-            ["launch/calibration.launch.py", "launch/gui.launch.py"],
+            [
+                "launch/calibration.launch.py",
+                "launch/gui.launch.py",
+                "launch/all.launch.py",
+            ],
         ),
     ],
     install_requires=["setuptools"],
