@@ -20,6 +20,12 @@ colcon build --packages-select arm_camera_calibration
 ros2 launch arm_camera_calibration calibration.launch.py
 ```
 
+Launch the GUI (shows images, progress bars, and control buttons):
+
+```bash
+ros2 launch arm_camera_calibration gui.launch.py
+```
+
 Optional refinement uses SciPy's LM solver. Ensure `python3-scipy` is installed if you enable
 `refine_with_lm`.
 
@@ -42,6 +48,12 @@ ros2 service call /clear_samples std_srvs/srv/Trigger {}
 - `pose_msg_type`: Pose message type (default: `geometry_msgs/msg/PoseStamped`). For
   `EndPosStruct`, set to `<your_package>/msg/EndPosStruct`; `rx_pos/ry_pos/rz_pos` are
   interpreted as roll/pitch/yaw in radians.
+- `auto_start`: Start collecting immediately (default: `true`). Set `false` for GUI workflows.
+- `coverage_bins`: Number of bins per coverage metric (default: `5`).
+- `x_min` / `x_max`: Coverage range for X in meters (default: `-0.1` to `0.1`).
+- `y_min` / `y_max`: Coverage range for Y in meters (default: `-0.1` to `0.1`).
+- `size_min` / `size_max`: Coverage range for board size ratio (default: `0.02` to `0.2`).
+- `skew_min` / `skew_max`: Coverage range for skew angle in degrees (default: `0` to `20`).
 - `chessboard_rows`: Inner corner rows (default: `6`).
 - `chessboard_cols`: Inner corner cols (default: `9`).
 - `square_size`: Chessboard square size in meters (default: `0.025`).

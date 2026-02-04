@@ -1,5 +1,6 @@
 import importlib
 import math
+import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -42,6 +43,7 @@ class ArmCameraCalibrationNode(Node):
         self.declare_parameter("image_topic", "/camera/image")
         self.declare_parameter("pose_topic", "/arm/pose")
         self.declare_parameter("pose_msg_type", "geometry_msgs/msg/PoseStamped")
+        self.declare_parameter("auto_start", True)
         self.declare_parameter("chessboard_rows", 6)
         self.declare_parameter("chessboard_cols", 9)
         self.declare_parameter("square_size", 0.025)
@@ -58,11 +60,23 @@ class ArmCameraCalibrationNode(Node):
         self.declare_parameter("refine_reproj_weight", 1.0)
         self.declare_parameter("refine_motion_weight", 1.0)
         self.declare_parameter("optimize_tcp_offset", False)
+        self.declare_parameter("coverage_bins", 5)
+        self.declare_parameter("x_min", -0.1)
+        self.declare_parameter("x_max", 0.1)
+        self.declare_parameter("y_min", -0.1)
+        self.declare_parameter("y_max", 0.1)
+        self.declare_parameter("size_min", 0.02)
+        self.declare_parameter("size_max", 0.2)
+        self.declare_parameter("skew_min", 0.0)
+        self.declare_parameter("skew_max", 20.0)
 
         image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
         pose_topic = self.get_parameter("pose_topic").get_parameter_value().string_value
         self.pose_msg_type_name = (
             self.get_parameter("pose_msg_type").get_parameter_value().string_value
+        )
+        self.auto_start = (
+            self.get_parameter("auto_start").get_parameter_value().bool_value
         )
         self.chessboard_rows = (
             self.get_parameter("chessboard_rows").get_parameter_value().integer_value
@@ -110,10 +124,45 @@ class ArmCameraCalibrationNode(Node):
         self.optimize_tcp_offset = (
             self.get_parameter("optimize_tcp_offset").get_parameter_value().bool_value
         )
+        self.coverage_bins = (
+            self.get_parameter("coverage_bins").get_parameter_value().integer_value
+        )
+        self.coverage_ranges = {
+            "x": (
+                self.get_parameter("x_min").get_parameter_value().double_value,
+                self.get_parameter("x_max").get_parameter_value().double_value,
+            ),
+            "y": (
+                self.get_parameter("y_min").get_parameter_value().double_value,
+                self.get_parameter("y_max").get_parameter_value().double_value,
+            ),
+            "size": (
+                self.get_parameter("size_min").get_parameter_value().double_value,
+                self.get_parameter("size_max").get_parameter_value().double_value,
+            ),
+            "skew": (
+                self.get_parameter("skew_min").get_parameter_value().double_value,
+                self.get_parameter("skew_max").get_parameter_value().double_value,
+            ),
+        }
 
         self.samples: List[Sample] = []
         self.bridge = CvBridge()
         self.image_size: Optional[Tuple[int, int]] = None
+        self.last_image: Optional[np.ndarray] = None
+        self.last_corners: Optional[np.ndarray] = None
+        self.last_found = False
+        self.image_lock = threading.Lock()
+        self.latest_pose_msg: Optional[object] = None
+        self.base_to_gripper_start: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self.started = self.auto_start
+        self.coverage_bins_seen = {
+            "x": set(),
+            "y": set(),
+            "size": set(),
+            "skew": set(),
+        }
+        self.last_calibration: Optional[dict] = None
 
         self.camera_info_pub = self.create_publisher(CameraInfo, self.camera_info_topic, 10)
         self.extrinsic_pub = self.create_publisher(
@@ -131,12 +180,15 @@ class ArmCameraCalibrationNode(Node):
 
         self.calibrate_srv = self.create_service(Trigger, "calibrate", self._on_calibrate)
         self.clear_srv = self.create_service(Trigger, "clear_samples", self._on_clear)
+        self.start_srv = self.create_service(Trigger, "start", self._on_start)
+        self.restart_srv = self.create_service(Trigger, "restart", self._on_restart)
 
         self.get_logger().info(
             "Arm-camera calibration node started. Waiting for synced image and pose data."
         )
 
     def _sync_callback(self, image_msg: Image, pose_msg: object) -> None:
+        self.latest_pose_msg = pose_msg
         try:
             cv_image = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
         except Exception as exc:
@@ -149,10 +201,22 @@ class ArmCameraCalibrationNode(Node):
         )
         if not found:
             self.get_logger().debug("Chessboard not found in current image.")
+            with self.image_lock:
+                self.last_image = cv_image
+                self.last_corners = None
+                self.last_found = False
             return
 
         criteria = (cv2.TermCriteria_EPS + cv2.TermCriteria_MAX_ITER, 30, 0.001)
         corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+
+        with self.image_lock:
+            self.last_image = cv_image
+            self.last_corners = corners
+            self.last_found = True
+
+        if not self.started:
+            return
 
         objp = self._create_object_points()
         r_gripper2base, t_gripper2base = self._pose_to_gripper2base(pose_msg)
@@ -163,6 +227,7 @@ class ArmCameraCalibrationNode(Node):
         )
         self.samples.append(sample)
         self.image_size = (gray.shape[1], gray.shape[0])
+        self._update_coverage(pose_msg, corners, self.image_size)
         self.get_logger().info(
             f"Captured sample {len(self.samples)} with chessboard detection."
         )
@@ -170,9 +235,24 @@ class ArmCameraCalibrationNode(Node):
     def _on_clear(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.samples.clear()
         self.image_size = None
+        self._reset_coverage()
         response.success = True
         response.message = "Cleared calibration samples."
         self.get_logger().info(response.message)
+        return response
+
+    def _on_start(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        success, message = self.start_collection()
+        response.success = success
+        response.message = message
+        return response
+
+    def _on_restart(
+        self, _request: Trigger.Request, response: Trigger.Response
+    ) -> Trigger.Response:
+        self.restart_collection()
+        response.success = True
+        response.message = "Restarted calibration session."
         return response
 
     def _on_calibrate(
@@ -255,10 +335,54 @@ class ArmCameraCalibrationNode(Node):
             self.extrinsic_pub.publish(transform_msg)
             self.tf_broadcaster.sendTransform(transform_msg)
 
+        self.last_calibration = {
+            "camera_matrix": camera_matrix,
+            "dist_coeffs": dist_coeffs,
+            "r_base2cam": r_base2cam,
+            "t_base2cam": t_base2cam,
+        }
         response.success = True
         response.message = "Calibration completed and results published."
         self.get_logger().info(response.message)
         return response
+
+    def start_collection(self) -> Tuple[bool, str]:
+        if self.latest_pose_msg is None:
+            return False, "No pose received yet; cannot start."
+        self.base_to_gripper_start = self._pose_to_base_to_gripper(self.latest_pose_msg)
+        self.started = True
+        self.samples.clear()
+        self.image_size = None
+        self._reset_coverage()
+        self.get_logger().info("Calibration started: base frame reset to current pose.")
+        return True, "Calibration started."
+
+    def restart_collection(self) -> None:
+        self.started = False
+        self.base_to_gripper_start = None
+        self.samples.clear()
+        self.image_size = None
+        self._reset_coverage()
+        self.get_logger().info("Calibration reset. Awaiting start.")
+
+    def get_display_image(self) -> Optional[np.ndarray]:
+        with self.image_lock:
+            if self.last_image is None:
+                return None
+            image = self.last_image.copy()
+            corners = None if self.last_corners is None else self.last_corners.copy()
+            found = self.last_found
+        if found and corners is not None:
+            cv2.drawChessboardCorners(
+                image, (self.chessboard_cols, self.chessboard_rows), corners, True
+            )
+        return image
+
+    def get_coverage_progress(self) -> dict:
+        progress = {}
+        for key, bins in self.coverage_bins_seen.items():
+            progress[key] = min(len(bins) / max(self.coverage_bins, 1), 1.0)
+        return progress
 
     def _build_camera_info(self, camera_matrix: np.ndarray, dist: np.ndarray) -> CameraInfo:
         camera_info = CameraInfo()
@@ -462,33 +586,7 @@ class ArmCameraCalibrationNode(Node):
         return grid
 
     def _pose_to_gripper2base(self, pose_msg: object) -> Tuple[np.ndarray, np.ndarray]:
-        if hasattr(pose_msg, "pose"):
-            position = pose_msg.pose.position
-            orientation = pose_msg.pose.orientation
-            r_base2gripper = self._quaternion_to_rotation(
-                np.array([orientation.x, orientation.y, orientation.z, orientation.w])
-            )
-            t_base2gripper = np.array([position.x, position.y, position.z]).reshape(3, 1)
-        elif all(
-            hasattr(pose_msg, attr)
-            for attr in ("x_pos", "y_pos", "z_pos", "rx_pos", "ry_pos", "rz_pos")
-        ):
-            t_base2gripper = np.array(
-                [
-                    pose_msg.x_pos.data,
-                    pose_msg.y_pos.data,
-                    pose_msg.z_pos.data,
-                ]
-            ).reshape(3, 1)
-            r_base2gripper = self._rpy_to_rotation(
-                pose_msg.rx_pos.data,
-                pose_msg.ry_pos.data,
-                pose_msg.rz_pos.data,
-            )
-        else:
-            raise ValueError(
-                "Unsupported pose message type. Expected PoseStamped or EndPosStruct-like."
-            )
+        r_base2gripper, t_base2gripper = self._pose_to_base0_to_gripper(pose_msg)
         r_gripper2base, t_gripper2base = self._invert_transform(
             r_base2gripper, t_base2gripper
         )
@@ -537,6 +635,103 @@ class ArmCameraCalibrationNode(Node):
             raise RuntimeError(
                 f"Failed to import pose_msg_type '{type_name}': {exc}"
             ) from exc
+
+    def _pose_to_base_to_gripper(self, pose_msg: object) -> Tuple[np.ndarray, np.ndarray]:
+        if hasattr(pose_msg, "pose"):
+            position = pose_msg.pose.position
+            orientation = pose_msg.pose.orientation
+            r_base2gripper = self._quaternion_to_rotation(
+                np.array([orientation.x, orientation.y, orientation.z, orientation.w])
+            )
+            t_base2gripper = np.array([position.x, position.y, position.z]).reshape(3, 1)
+        elif all(
+            hasattr(pose_msg, attr)
+            for attr in ("x_pos", "y_pos", "z_pos", "rx_pos", "ry_pos", "rz_pos")
+        ):
+            t_base2gripper = np.array(
+                [
+                    pose_msg.x_pos.data,
+                    pose_msg.y_pos.data,
+                    pose_msg.z_pos.data,
+                ]
+            ).reshape(3, 1)
+            r_base2gripper = self._rpy_to_rotation(
+                pose_msg.rx_pos.data,
+                pose_msg.ry_pos.data,
+                pose_msg.rz_pos.data,
+            )
+        else:
+            raise ValueError(
+                "Unsupported pose message type. Expected PoseStamped or EndPosStruct-like."
+            )
+        return r_base2gripper, t_base2gripper
+
+    def _pose_to_base0_to_gripper(self, pose_msg: object) -> Tuple[np.ndarray, np.ndarray]:
+        r_base2gripper, t_base2gripper = self._pose_to_base_to_gripper(pose_msg)
+        if self.base_to_gripper_start is None:
+            return r_base2gripper, t_base2gripper
+        r_base0_start, t_base0_start = self.base_to_gripper_start
+        r_start_inv, t_start_inv = self._invert_transform(r_base0_start, t_base0_start)
+        return self._compose_transform(r_start_inv, t_start_inv, r_base2gripper, t_base2gripper)
+
+    def _reset_coverage(self) -> None:
+        for key in self.coverage_bins_seen:
+            self.coverage_bins_seen[key].clear()
+
+    def _update_coverage(
+        self, pose_msg: object, corners: np.ndarray, image_size: Tuple[int, int]
+    ) -> None:
+        r_base2gripper, t_base2gripper = self._pose_to_base0_to_gripper(pose_msg)
+        x_val = float(t_base2gripper[0])
+        y_val = float(t_base2gripper[1])
+
+        size_val = self._compute_board_size(corners, image_size)
+        skew_val = self._compute_board_skew(corners)
+
+        values = {
+            "x": x_val,
+            "y": y_val,
+            "size": size_val,
+            "skew": skew_val,
+        }
+        for key, value in values.items():
+            min_val, max_val = self.coverage_ranges[key]
+            bin_index = self._bin_value(value, min_val, max_val, self.coverage_bins)
+            if bin_index is not None:
+                self.coverage_bins_seen[key].add(bin_index)
+
+    @staticmethod
+    def _bin_value(value: float, min_val: float, max_val: float, bins: int) -> Optional[int]:
+        if bins <= 0:
+            return None
+        if value < min_val or value > max_val:
+            return None
+        ratio = (value - min_val) / max(max_val - min_val, 1e-9)
+        index = min(int(ratio * bins), bins - 1)
+        return index
+
+    @staticmethod
+    def _compute_board_size(corners: np.ndarray, image_size: Tuple[int, int]) -> float:
+        width, height = image_size
+        if width == 0 or height == 0:
+            return 0.0
+        corners_2d = corners.reshape(-1, 2).astype(np.float32)
+        rect = cv2.minAreaRect(corners_2d)
+        area = rect[1][0] * rect[1][1]
+        return float(area / float(width * height))
+
+    def _compute_board_skew(self, corners: np.ndarray) -> float:
+        corners_2d = corners.reshape(-1, 2)
+        idx_x = self.chessboard_cols - 1
+        idx_y = (self.chessboard_rows - 1) * self.chessboard_cols
+        v1 = corners_2d[idx_x] - corners_2d[0]
+        v2 = corners_2d[idx_y] - corners_2d[0]
+        norm = np.linalg.norm(v1) * np.linalg.norm(v2)
+        if norm == 0:
+            return 0.0
+        cos_angle = float(np.clip(np.dot(v1, v2) / norm, -1.0, 1.0))
+        angle = math.degrees(math.acos(cos_angle))
+        return abs(90.0 - angle)
 
     @staticmethod
     def _quaternion_to_rotation(quaternion: np.ndarray) -> np.ndarray:
