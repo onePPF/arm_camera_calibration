@@ -1,3 +1,4 @@
+import importlib
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -7,7 +8,7 @@ import message_filters
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from std_srvs.srv import Trigger
@@ -40,6 +41,7 @@ class ArmCameraCalibrationNode(Node):
         super().__init__("arm_camera_calibration")
         self.declare_parameter("image_topic", "/camera/image")
         self.declare_parameter("pose_topic", "/arm/pose")
+        self.declare_parameter("pose_msg_type", "geometry_msgs/msg/PoseStamped")
         self.declare_parameter("chessboard_rows", 6)
         self.declare_parameter("chessboard_cols", 9)
         self.declare_parameter("square_size", 0.025)
@@ -59,6 +61,9 @@ class ArmCameraCalibrationNode(Node):
 
         image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
         pose_topic = self.get_parameter("pose_topic").get_parameter_value().string_value
+        self.pose_msg_type_name = (
+            self.get_parameter("pose_msg_type").get_parameter_value().string_value
+        )
         self.chessboard_rows = (
             self.get_parameter("chessboard_rows").get_parameter_value().integer_value
         )
@@ -117,7 +122,8 @@ class ArmCameraCalibrationNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
 
         image_sub = message_filters.Subscriber(self, Image, image_topic)
-        pose_sub = message_filters.Subscriber(self, PoseStamped, pose_topic)
+        pose_msg_type = self._load_pose_msg_type(self.pose_msg_type_name)
+        pose_sub = message_filters.Subscriber(self, pose_msg_type, pose_topic)
         sync = message_filters.ApproximateTimeSynchronizer(
             [image_sub, pose_sub], queue_size=10, slop=0.1
         )
@@ -130,7 +136,7 @@ class ArmCameraCalibrationNode(Node):
             "Arm-camera calibration node started. Waiting for synced image and pose data."
         )
 
-    def _sync_callback(self, image_msg: Image, pose_msg: PoseStamped) -> None:
+    def _sync_callback(self, image_msg: Image, pose_msg: object) -> None:
         try:
             cv_image = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
         except Exception as exc:
@@ -455,15 +461,34 @@ class ArmCameraCalibrationNode(Node):
         grid *= self.square_size
         return grid
 
-    def _pose_to_gripper2base(
-        self, pose_msg: PoseStamped
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        position = pose_msg.pose.position
-        orientation = pose_msg.pose.orientation
-        r_base2gripper = self._quaternion_to_rotation(
-            np.array([orientation.x, orientation.y, orientation.z, orientation.w])
-        )
-        t_base2gripper = np.array([position.x, position.y, position.z]).reshape(3, 1)
+    def _pose_to_gripper2base(self, pose_msg: object) -> Tuple[np.ndarray, np.ndarray]:
+        if hasattr(pose_msg, "pose"):
+            position = pose_msg.pose.position
+            orientation = pose_msg.pose.orientation
+            r_base2gripper = self._quaternion_to_rotation(
+                np.array([orientation.x, orientation.y, orientation.z, orientation.w])
+            )
+            t_base2gripper = np.array([position.x, position.y, position.z]).reshape(3, 1)
+        elif all(
+            hasattr(pose_msg, attr)
+            for attr in ("x_pos", "y_pos", "z_pos", "rx_pos", "ry_pos", "rz_pos")
+        ):
+            t_base2gripper = np.array(
+                [
+                    pose_msg.x_pos.data,
+                    pose_msg.y_pos.data,
+                    pose_msg.z_pos.data,
+                ]
+            ).reshape(3, 1)
+            r_base2gripper = self._rpy_to_rotation(
+                pose_msg.rx_pos.data,
+                pose_msg.ry_pos.data,
+                pose_msg.rz_pos.data,
+            )
+        else:
+            raise ValueError(
+                "Unsupported pose message type. Expected PoseStamped or EndPosStruct-like."
+            )
         r_gripper2base, t_gripper2base = self._invert_transform(
             r_base2gripper, t_base2gripper
         )
@@ -484,6 +509,34 @@ class ArmCameraCalibrationNode(Node):
         r = r_a @ r_b
         t = r_a @ t_b + t_a
         return r, t
+
+    @staticmethod
+    def _rpy_to_rotation(roll: float, pitch: float, yaw: float) -> np.ndarray:
+        cr = math.cos(roll)
+        sr = math.sin(roll)
+        cp = math.cos(pitch)
+        sp = math.sin(pitch)
+        cy = math.cos(yaw)
+        sy = math.sin(yaw)
+        return np.array(
+            [
+                [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                [-sp, cp * sr, cp * cr],
+            ],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _load_pose_msg_type(type_name: str) -> type:
+        try:
+            module_name, class_name = type_name.split("/")
+            module = importlib.import_module(f"{module_name}.msg")
+            return getattr(module, class_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to import pose_msg_type '{type_name}': {exc}"
+            ) from exc
 
     @staticmethod
     def _quaternion_to_rotation(quaternion: np.ndarray) -> np.ndarray:

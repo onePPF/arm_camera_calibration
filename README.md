@@ -39,6 +39,9 @@ ros2 service call /clear_samples std_srvs/srv/Trigger {}
 
 - `image_topic`: Image topic (default: `/camera/image`).
 - `pose_topic`: Pose topic (default: `/arm/pose`).
+- `pose_msg_type`: Pose message type (default: `geometry_msgs/msg/PoseStamped`). For
+  `EndPosStruct`, set to `<your_package>/msg/EndPosStruct`; `rx_pos/ry_pos/rz_pos` are
+  interpreted as roll/pitch/yaw in radians.
 - `chessboard_rows`: Inner corner rows (default: `6`).
 - `chessboard_cols`: Inner corner cols (default: `9`).
 - `square_size`: Chessboard square size in meters (default: `0.025`).

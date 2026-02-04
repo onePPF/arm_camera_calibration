@@ -14,6 +14,7 @@ def generate_launch_description():
                     {
                         "image_topic": "/camera/image",
                         "pose_topic": "/arm/pose",
+                        "pose_msg_type": "geometry_msgs/msg/PoseStamped",
                         "chessboard_rows": 6,
                         "chessboard_cols": 9,
                         "square_size": 0.025,
